@@ -1,0 +1,67 @@
+name: Enforce owner's Windows runner
+
+# Uses only trusted base-branch code and GitHub API data.
+# Never checkout or execute code from a pull request on the owner's PC.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  runner-policy:
+    name: Check workflow runners (read-only)
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 5
+    steps:
+      - name: Reject nonlocal runners in changed workflows
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          $pr = Invoke-RestMethod -Uri "$api/pulls/$env:PR_NUMBER" -Headers $headers
+          $headRepo = $pr.head.repo.full_name
+          $headSha = $pr.head.sha
+          $files = @(Invoke-RestMethod -Uri "$api/pulls/$env:PR_NUMBER/files?per_page=100" -Headers $headers)
+          if ($files.Count -ge 100) {
+            throw "PR has 100 or more files: split it to allow reliable CI policy auditing."
+          }
+          $checked = 0
+          foreach ($file in $files) {
+            if ($file.filename -notmatch '^\.github/workflows/.+\.ya?ml$' -or $file.status -eq 'removed') {
+              continue
+            }
+            $uri = "https://api.github.com/repos/$headRepo/contents/$($file.filename)?ref=$headSha"
+            $doc = Invoke-RestMethod -Uri $uri -Headers $headers
+            if ($doc.encoding -ne 'base64' -or -not $doc.content) {
+              throw "Cannot read full workflow content for $($file.filename)"
+            }
+            $source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($doc.content -replace '\s', '')))
+            $runners = @([regex]::Matches($source, '(?m)^[ \t]*runs-on:[ \t]*(.+?)[ \t]*\r?$'))
+            if ($runners.Count -eq 0) {
+              throw "$($file.filename): no explicit local runs-on found; reusable cloud jobs are not allowed."
+            }
+            foreach ($runner in $runners) {
+              if ($runner.Groups[1].Value.Trim() -cne '[self-hosted, Windows, X64]') {
+                throw "$($file.filename): prohibited runs-on: $($runner.Groups[1].Value)"
+              }
+            }
+            if ($source -match '(?m)^[ \t]*uses:[ \t]*[^\r\n]*\.github/workflows/') {
+              throw "$($file.filename): reusable workflows require separate runner audit and are not allowed."
+            }
+            Write-Host "PASS $($file.filename): $($runners.Count) local job(s)"
+            $checked++
+          }
+          Write-Host "Verified $checked changed GitHub Actions workflows without checking out PR code."
